@@ -1,0 +1,30 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Env & secrets
+.env
+*.env
+secure_data/
+
+# WhatsApp auth/cache
+.wwebjs_auth/
+.wwebjs_cache/
+receipts/
+
+# Build outputs
+dist/
+build/
+coverage/
+
+# Editor/OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
