@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dashboard</title>
+  <style>
+    :root{--bg:#0d0f14;--panel:#161a22;--text:#e8e8e8;--muted:#9aa5b1;--accent:#ffc107;--accent2:#18a0fb;--accent3:#26c6da}
+    *{box-sizing:border-box}
+    body{font-family:Inter,system-ui,Arial;background:var(--bg);color:var(--text);margin:0}
+    header{display:flex;justify-content:space-between;align-items:center;padding:16px}
+    .grid{display:grid;grid-template-columns:repeat(4,minmax(160px,1fr));gap:12px;padding:16px}
+    .card{background:var(--panel);padding:14px;border-radius:12px;border:1px solid #222834}
+    .num{font-size:28px;font-weight:700}
+    .muted{color:var(--muted)}
+    .section{padding:16px}
+    .btn{background:#0b0d11;color:#cdd7e3;border:1px solid #222834;padding:8px 12px;border-radius:8px;text-decoration:none}
+    .row{display:flex;gap:10px;align-items:center}
+    input{background:#0b0d11;color:#fff;border:1px solid #222834;border-radius:8px;padding:8px}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid #222834;padding:8px;text-align:left}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="row">
+      <strong>Dashboard</strong>
+    </div>
+    <div class="row">
+      <input id="api" placeholder="API" style="width:280px">
+      <input id="token" placeholder="Token" style="width:280px">
+      <button id="save" class="btn">Simpan</button>
+    </div>
+  </header>
+  <div class="grid" id="cards"></div>
+  <div class="section">
+    <div class="row" style="justify-content:space-between">
+      <div class="muted">Issues Terkini</div>
+      <a id="exportIssues" class="btn" href="#">Export Issues</a>
+    </div>
+    <div id="issuesWrap"></div>
+  </div>
+  <div class="section">
+    <div class="row" style="justify-content:space-between">
+      <div class="muted">Purchases Terkini</div>
+      <a id="exportPurchases" class="btn" href="#">Export Purchases</a>
+    </div>
+    <div id="purchasesWrap"></div>
+  </div>
+  <script>
+    var API=(localStorage.getItem('api')|| (location.origin.indexOf('sanztech.online')>-1?'https://bot.sanztech.online':''));
+    var TOKEN=(localStorage.getItem('token')|| new URLSearchParams(location.search).get('token')||'');
+    if(TOKEN) localStorage.setItem('token', TOKEN);
+    document.getElementById('api').value=API; document.getElementById('token').value=TOKEN;
+    document.getElementById('save').onclick=function(){ API=document.getElementById('api').value||''; TOKEN=document.getElementById('token').value||''; localStorage.setItem('api',API); localStorage.setItem('token',TOKEN); loadAll() };
+    function apiUrl(p){ var u=(API?API:'')+p; if(TOKEN){ u+= (u.indexOf('?')>-1?'&':'?')+'token='+TOKEN } return u }
+    function renderCards(s){ var el=document.getElementById('cards'); el.innerHTML = '<div class="card"><div class="muted">Customers</div><div class="num">'+s.customers+'</div></div>'+'<div class="card"><div class="muted">Contacts</div><div class="num">'+s.contacts+'</div></div>'+'<div class="card"><div class="muted">Purchases</div><div class="num">'+s.purchases+'</div></div>'+'<div class="card"><div class="muted">Income RM</div><div class="num">'+s.incomeRM+'</div></div>' }
+    function table(head,rows){ return '<table><thead><tr>'+head.map(function(h){return'<th>'+h+'</th>'}).join('')+'</tr></thead><tbody>'+rows.map(function(r){return'<tr>'+r.map(function(c){return'<td>'+String(c||'')+'</td>'}).join('')+'</tr>'}).join('')+'</tbody></table>' }
+    async function loadStats(){ try{ var r=await fetch(apiUrl('/api/stats')); if(!r.ok) return; var s=await r.json(); renderCards(s) }catch(e){} }
+    async function loadIssues(){ try{ var r=await fetch(apiUrl('/api/issues')); if(!r.ok) return; var arr=await r.json(); var rows=arr.slice(-20).reverse().map(function(i){ return [i.name, i.buyerPhone, (i.account||{}).email||'', (i.message||'').slice(0,120), i.at] }); document.getElementById('issuesWrap').innerHTML=table(['Name','Phone','Email','Message','Date'], rows) }catch(e){} }
+    async function loadPurchases(){ try{ var r=await fetch(apiUrl('/api/purchases')); if(!r.ok) return; var arr=await r.json(); var rows=arr.slice(-20).reverse().map(function(p){ return [p.buyerName, p.buyerPhone, p.planType, p.planMonths, p.priceRM, p.at] }); document.getElementById('purchasesWrap').innerHTML=table(['Name','Phone','Plan','Months','Price RM','Date'], rows) }catch(e){} }
+    function setExportLinks(){ document.getElementById('exportIssues').href=apiUrl('/api/export?type=issues'); document.getElementById('exportPurchases').href=apiUrl('/api/export?type=purchases') }
+    async function loadAll(){ setExportLinks(); await loadStats(); await loadIssues(); await loadPurchases() }
+    loadAll()
+  </script>
+</body>
+</html>
