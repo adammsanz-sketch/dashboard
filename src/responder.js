@@ -34,6 +34,7 @@ const affirm = ['ya','ok','okay','baik','boleh','setuju']
 const deny = ['tak','tidak','no','x','taknak','belum']
 const random = (arr) => arr[Math.floor(Math.random()*arr.length)]
 const enders = ['🙂','😉','👌','👍','🙏']
+const EMOJI_RE = /[\u{1F300}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{1F1E6}-\u{1F1FF}]/u
 
 export const humanize = (text) => {
   const softeners = ['baik','okey','ya','sekejap ya','tunggu sekejap','noted']
@@ -141,6 +142,12 @@ async function callLLM(prompt, user){
 export function buildResponder(){
   return async function respond(body, name='Kawan'){
     const txt = normalize(body)
+    const raw = body || ''
+
+    if(EMOJI_RE.test(raw) && raw.replace(EMOJI_RE,'').trim().length===0){
+      const e = raw.match(EMOJI_RE)?.[0] || random(enders)
+      return { reply: e, delayMs: calcDelay(body, 2) }
+    }
 
     if(keywordIssue(txt)){
       const reply = humanize(`Maaf atas kesulitan. Saya sudah rekod isu akaun anda dan akan semak segera. Boleh hantar screenshot ralat kalau ada? Jika akaun tidak valid atau bermasalah, kami akan ganti segera.`)
@@ -153,7 +160,7 @@ export function buildResponder(){
     }
 
     if(keywordHelp(txt)){
-      const reply = humanize(`Jika ada yang tidak faham (cara login atau lain-lain), boleh WhatsApp admin di sini. Tunggu sekejap, kami akan bantu.`)
+      const reply = humanize(`Jika ada yang tidak faham (cara login atau lain-lain), boleh WhatsApp admin: https://wa.me/qr/LYVUPSNLE4MXD1. Tunggu sekejap, kami akan bantu.`)
       return { reply, delayMs: calcDelay(body, reply.length) }
     }
 
@@ -168,17 +175,17 @@ export function buildResponder(){
       else if(/refund|pulangan/.test(txt)) cat = 'REFUND'
       else if(/approve|sahkan/.test(txt)) cat = 'APPROVE'
       else if(/bank in|transfer bank/.test(txt)) cat = 'PAYMENT'
-      const reply = humanize(`Baik, saya rujuk kepada admin untuk sahkan/perjelas. Tunggu sekejap ya.`)
+      const reply = humanize(`Baik, saya rujuk kepada admin untuk sahkan/perjelas. Jika perlu segera, WhatsApp admin: https://wa.me/qr/LYVUPSNLE4MXD1. Tunggu sekejap ya.`)
       return { reply, delayMs: calcDelay(body, reply.length), notifyAdmin: true, notifyCategory: cat }
     }
 
     if(keywordLoginHelp(txt) || keywordHelpGeneral(txt)){
-      const reply = humanize(`Cara login ringkas:\n1) Buka aplikasi/website Netflix\n2) Tekan Sign In\n3) Masukkan email & password yang diberi\nJika masih keliru, tunggu sekejap ya — admin akan bantu.`)
+      const reply = humanize(`Cara login ringkas:\n1) Buka aplikasi/website Netflix\n2) Tekan Sign In\n3) Masukkan email & password yang diberi\nJika masih keliru, boleh WhatsApp admin: https://wa.me/qr/LYVUPSNLE4MXD1.`)
       return { reply, delayMs: calcDelay(body, reply.length) }
     }
 
     if(keywordQuestion(txt)){
-      const reply = humanize(`Baik, saya rujuk soalan ini kepada admin untuk jawapan tepat. Tunggu sekejap ya.`)
+      const reply = humanize(`Baik, saya rujuk soalan ini kepada admin untuk jawapan tepat. Untuk bantuan segera, WhatsApp admin: https://wa.me/qr/LYVUPSNLE4MXD1.`)
       return { reply, delayMs: calcDelay(body, reply.length), notifyAdmin: true, notifyCategory: 'QUESTION' }
     }
 

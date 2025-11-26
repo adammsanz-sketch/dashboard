@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿import qrcode from 'qrcode-terminal'
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿import qrcode from 'qrcode-terminal'
 import QRCode from 'qrcode'
 import fs from 'fs'
 import path from 'path'
@@ -63,6 +63,26 @@ function extractPlanType(s){
   if(t.includes('premium')) return 'premium'
   if(t.includes('standard') && t.includes('ads')) return 'ads'
   if(t.includes('standard')) return 'standard'
+  return null
+}
+function extractAmountRM(s){
+  const t = String(s||'').toLowerCase()
+  let m = t.match(/rm\s*([0-9]+(?:\.[0-9]+)?)/)
+  if(!m) m = t.match(/([0-9]+(?:\.[0-9]+)?)\s*rm/)
+  if(!m) m = t.match(/\b([0-9]{1,3})(?:\.[0-9]{1,2})?\b/)
+  if(!m) return null
+  return Math.round(parseFloat(m[1]))
+}
+function inferPlanByAmount(amount){
+  const a = Number(amount||0)
+  if(!a) return null
+  const tbl = { premium: { 1:14, 3:30 }, standard: { 1:9, 3:25, 6:48, 12:90, 24:121 } }
+  for(const [plan, monthsMap] of Object.entries(tbl)){
+    for(const [mStr, price] of Object.entries(monthsMap)){
+      const m = Number(mStr)
+      if(price === a) return { planType: plan, months: m }
+    }
+  }
   return null
 }
 
@@ -177,7 +197,10 @@ function setPaymentVerifiedByPhone(phone, ok){
 async function allocateForPhone(phone){
   const chatId = getChatIdByPhone(phone||'')
   if(!chatId) return false
-  const desiredPlan = lastPlanTypeByChat.get(chatId) || null
+  let desiredPlan = null
+  const latest = getLatestPaymentForPhone(phone||'')
+  if(latest && latest.planType) desiredPlan = latest.planType
+  if(!desiredPlan) desiredPlan = lastPlanTypeByChat.get(chatId) || null
   const acc = nextAvailable(desiredPlan)
   if(!acc) return false
   const used = loadUsed()
@@ -189,6 +212,15 @@ async function allocateForPhone(phone){
   const text = `Akaun anda:\nEmail: ${acc.email}\nPassword: ${acc.password}\nPlan: ${acc.plan || 'tidak pasti'}\nSila login pada Netflix. Jika ada isu, beritahu kami. Jangan risau, jika akaun tidak valid atau ada masalah, kami akan ganti segera.`
   try{ await client.sendMessage(chatId, text) }catch{}
   return true
+}
+function getLatestPaymentForPhone(phone){
+  try{
+    const d = loadUsed()
+    const pays = Array.isArray(d.payments)?d.payments:[]
+    const pnum = String(phone||'').replace(/[^0-9]/g,'')
+    for(let i=pays.length-1;i>=0;i--){ const p=pays[i]; const ph=String(p.buyerPhone||'').replace(/[^0-9]/g,''); if(ph===pnum) return p }
+  }catch{}
+  return null
 }
 
 const client = new Client({
@@ -232,28 +264,53 @@ client.on('message', async (msg) => {
     if (msg.hasMedia) {
       try {
         const media = await msg.downloadMedia()
-        const ext = (media.mimetype?.split('/')?.[1] || 'bin').replace(/[^a-z0-9]/gi,'')
-        const ts = new Date().toISOString().replace(/[:.]/g,'-')
-        const receiptsDir = path.resolve('./receipts')
-        if (!fs.existsSync(receiptsDir)) fs.mkdirSync(receiptsDir, { recursive: true })
-        const planMonths = planMonthsNow || lastPlanByChat.get(msg.from) || null
-        const suffix = planMonths ? `${planMonths}month` : 'unknown'
-        const filename = `receipt_${ts}_${sanitizeName(name)}_${suffix}.${ext}`
-        const filePath = path.join(receiptsDir, filename)
-        fs.writeFileSync(filePath, Buffer.from(media.data, 'base64'))
-        const planType = planTypeNow || lastPlanTypeByChat.get(msg.from) || null
-        const phone = extractPhone(msg.from)
-        recordPayment(name, planMonths || null, filename, planType || null, msg.from, phone || null)
-        queuePendingApproval(msg.from, name, phone || null, filename, planType || null, planMonths || null)
-        const reply = `Bukti pembayaran diterima (disimpan: ${filename}). Mohon tunggu 5 min untuk semakan admin.`
-        await chat.sendMessage(reply)
-        const adminId = ADMIN_CHAT_ID
-        if (adminId) {
-          const note = `APPROVAL PERLU\nPelanggan: ${name} (${msg.from})\nPhone: ${phone||''}\nPelan: ${(planType||'')||'-'} ${planMonths||''}m\nResit: ${filename}\nBalas: maya approve yes | maya approve no`
-          try { await client.sendMessage(adminId, note) } catch (e) { }
-          setTimeout(async()=>{ try{ await client.sendMessage(adminId, `Reminder approval: ${phone||''} | ${name}`) }catch{} }, 5*60*1000)
+        const mime = String(media.mimetype||'')
+        const typ = String(msg.type||'').toLowerCase()
+        const cap = String(msg._data?.caption || msg.body || '')
+        const capTxt = cap.toLowerCase()
+        const mentionsPay = /(resit|receipt|bukti|bayar|pembayaran|payment|transfer|bank|tng|touch|duitnow)/.test(capTxt)
+        const isSticker = (typ==='sticker') || (/^image\/webp$/i.test(mime) && !mentionsPay)
+        const isImageReceipt = (typ==='image') && /(image\/jpeg|image\/jpg|image\/png|image\/webp)/i.test(mime)
+        const isDocReceipt = (typ==='document') && /(application\/pdf|image\/jpeg|image\/jpg|image\/png)/i.test(mime)
+        if ((isImageReceipt || isDocReceipt) && mentionsPay) {
+          const ext = mime.includes('pdf') ? 'pdf' : (mime.includes('jpeg')||mime.includes('jpg')) ? 'jpg' : mime.includes('png') ? 'png' : 'bin'
+          const ts = new Date().toISOString().replace(/[:.]/g,'-')
+          const receiptsDir = path.resolve('./receipts')
+          if (!fs.existsSync(receiptsDir)) fs.mkdirSync(receiptsDir, { recursive: true })
+          let planMonths = planMonthsNow || lastPlanByChat.get(msg.from) || null
+          let planType = planTypeNow || lastPlanTypeByChat.get(msg.from) || null
+          const llm = ext!=='pdf' ? await analyzeReceiptLLM(media.data, mime, cap) : null
+          const amtText = extractAmountRM(cap)
+          const amt = llm?.amountRM || amtText || null
+          const inf = amt ? inferPlanByAmount(amt) : null
+          const priceMatched = !!inf
+          if(priceMatched){ if(!planMonths) planMonths = inf.months; if(!planType) planType = inf.planType }
+          const suffix = planMonths ? `${planMonths}month` : 'unknown'
+          const filename = `receipt_${ts}_${sanitizeName(name)}_${suffix}.${ext}`
+          const filePath = path.join(receiptsDir, filename)
+          fs.writeFileSync(filePath, Buffer.from(media.data, 'base64'))
+          planType = planType || (planTypeNow || lastPlanTypeByChat.get(msg.from) || null)
+          const phone = extractPhone(msg.from)
+          recordPayment(name, planMonths || null, filename, planType || null, msg.from, phone || null)
+          queuePendingApproval(msg.from, name, phone || null, filename, planType || null, planMonths || null)
+          const reply = `Bukti pembayaran diterima (disimpan: ${filename}). Mohon tunggu 5 min untuk semakan admin.`
+          await chat.sendMessage(reply)
+          const adminId = ADMIN_CHAT_ID
+          if (adminId) {
+            const note = `APPROVAL PERLU\nPelanggan: ${name} (${msg.from})\nPhone: ${phone||''}\nPelan: ${(planType||'')||'-'} ${planMonths||''}m\nJumlah: ${amt?('RM'+amt):'-'} (${priceMatched?'PADAN':'TIDAK PADAN'})\nResit: ${filename}\nBalas: maya approve yes | maya approve no`
+            try { await client.sendMessage(adminId, note) } catch (e) { }
+            setTimeout(async()=>{ try{ await client.sendMessage(adminId, `Reminder approval: ${phone||''} | ${name}`) }catch{} }, 5*60*1000)
+          }
+          return
+        } else if (isSticker) {
+          const emos = ['🙂','😉','👌','👍','🙏','🔥','🎉','💯']
+          const em = emos[Math.floor(Math.random()*emos.length)]
+          await chat.sendMessage(em)
+          return
+        } else if (typ==='image' || typ==='document') {
+          await chat.sendMessage(humanize('Imej diterima. Jika ini resit pembayaran, nyatakan "resit" pada kapsyen atau hantar screenshot resit yang jelas.'))
+          return
         }
-        return
       } catch (e) {
         console.error('Gagal terima/simpan media:', e)
       }
@@ -333,6 +390,10 @@ client.on('message', async (msg) => {
       } else if(tail.includes('resit') || tail.includes('receipt')){
         const lines = pays.map(p=>`${p.at||''} | ${p.buyerName||''} | ${p.planType||''} ${p.planMonths||''}m | ${p.receiptFile||''}`)
         text = `Resit pembayaran terkini (${pays.length}):\n${lines.join('\n') || 'Tiada rekod'}`
+      } else if(tail.includes('pending')){
+        const pend = (Array.isArray(d.pending)?d.pending:[]).slice(-8).reverse()
+        const lines = pend.map(p=>`${p.at||''} | ${p.buyerName||''} | ${p.phone||''} | ${p.planType||''} ${p.planMonths||''}m | ${p.receiptFile||''}`)
+        text = `Menunggu kelulusan (${pend.length}):\n${lines.join('\n') || 'Tiada pending'}`
       } else if(tail.includes('approve')){
         const yes = /(yes|ya|setuju|betul)/.test(tail)
         const no = /(no|tidak|x|reject|tolak)/.test(tail)
@@ -551,6 +612,11 @@ function startDashboardServer(){
   const server = http.createServer((req,res)=>{
     try{
       const u = new URL(req.url, 'http://localhost')
+      const allowOrigin = process.env.DASHBOARD_ORIGIN || '*'
+      res.setHeader('Access-Control-Allow-Origin', allowOrigin)
+      res.setHeader('Access-Control-Allow-Methods','GET,POST,PUT,PATCH,DELETE,OPTIONS')
+      res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Token, X-Admin-Key')
+      if(req.method === 'OPTIONS'){ res.writeHead(204); res.end(''); return }
       const allowed = ()=>{
         if(!DASHBOARD_TOKEN) return true
         const qtok = u.searchParams.get('token')
@@ -715,8 +781,12 @@ function startDashboardServer(){
             var cur=localStorage.getItem('themeMode')||'dark'; apply(cur);
             btn.onclick=function(){ cur = (document.body.classList.contains('light')?'dark':'light'); apply(cur) };
           }
+          var API=(localStorage.getItem('api')|| (location.origin.indexOf('sanztech.online')>-1?'https://bot.sanztech.online':''));
+          var TOKEN=(localStorage.getItem('token')|| new URLSearchParams(location.search).get('token')||'');
+          if(TOKEN) localStorage.setItem('token', TOKEN);
+          function apiUrl(p){ var u=(API?API:'')+p; if(TOKEN){ u+= (u.indexOf('?')>-1?'&':'?')+'token='+TOKEN } return u }
           async function refresh(){
-            try{ var rs=await fetch('/api/stats'); if(!rs.ok) return; var s=await rs.json(); renderCards(s); renderCharts(s); var ri=await fetch('/api/issues'); var arr= ri.ok? await ri.json() : []; renderQuick(s, arr); setupLightbox(); ensureIncomeSection(); var rp=await fetch('/api/purchases'); var ps= rp.ok? await rp.json() : []; renderIncomeChart(ps); ensureThemeToggle(); }catch(e){}
+            try{ var rs=await fetch(apiUrl('/api/stats')); if(!rs.ok) return; var s=await rs.json(); renderCards(s); renderCharts(s); var ri=await fetch(apiUrl('/api/issues')); var arr= ri.ok? await ri.json() : []; renderQuick(s, arr); setupLightbox(); ensureIncomeSection(); var rp=await fetch(apiUrl('/api/purchases')); var ps= rp.ok? await rp.json() : []; renderIncomeChart(ps); ensureThemeToggle(); }catch(e){}
           }
           setInterval(refresh, 8000);
           window.addEventListener('load', function(){ setTimeout(refresh, 400); });
@@ -743,14 +813,14 @@ function startDashboardServer(){
       }
       if(u.pathname === '/crm2'){
         if(!allowed()){ res.writeHead(401); res.end('Unauthorized'); return }
-        const html2 = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CRM</title><style>:root{--bg:#0d0f14;--panel:#161a22;--text:#e8e8e8;--muted:#9aa5b1}*{box-sizing:border-box}body{font-family:Inter,system-ui,Arial;background:var(--bg);color:var(--text);margin:0;display:flex;min-height:100vh}aside{width:220px;background:#0b0d11;border-right:1px solid #1f2530;padding:18px}aside a{display:block;padding:10px 12px;border-radius:8px;color:#cdd7e3;text-decoration:none;margin-bottom:6px;transition:all .2s ease}aside a.active{background:#141822;color:#fff;border:1px solid #222834}main{flex:1;padding:22px}h1{margin:0 0 12px}nav.tabs{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}nav.tabs button{background:#0b0d11;color:#cdd7e3;border:1px solid #222834;padding:8px 12px;border-radius:8px;cursor:pointer;transition:all .2s ease}nav.tabs button.active{background:#141822;color:#fff}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #222834;padding:8px;text-align:left}input[type=text]{background:#0b0d11;color:#fff;border:1px solid #222834;border-radius:8px;padding:8px;width:100%}.row{display:grid;grid-template-columns:1fr auto;gap:10px;margin-bottom:12px}@media (max-width:640px){aside{position:fixed;left:0;top:0;bottom:0;transform:translateX(-100%);transition:transform .25s ease;width:180px}aside.open{transform:translateX(0)}main{padding:16px}}.btn{background:#0b0d11;color:#cdd7e3;border:1px solid #222834;padding:8px 12px;border-radius:8px;text-decoration:none;transition:all .2s ease}.btn:hover{background:#141822;color:#fff}.topbar{display:none}@media (max-width:640px){.topbar{display:flex;align-items:center;gap:12px;background:#0b0d11;border-bottom:1px solid #1f2530;padding:10px 14px;position:sticky;top:0;z-index:10}}</style></head><body><aside id="crmNav"><a href="/dashboard2">Dashboard</a><a class="active" href="/crm2">CRM</a><a href="/api/stats">API</a></aside><div style="flex:1;display:flex;flex-direction:column"><div class="topbar"><button id="menu2" class="btn">Menu</button><div style="flex:1"></div><a class="btn" href="/dashboard2">Dashboard</a></div><main><h1>CRM</h1><nav class="tabs"><button data-tab="contacts" class="active">Contacts</button><button data-tab="purchases">Purchases</button><button data-tab="issues">Issues</button><button data-tab="replacements">Replacements</button></nav><div class="row"><input id="search" type="text" placeholder="Search"/><a id="exportLink" href="#" class="btn">Export CSV</a></div><div id="tableWrap"></div><script>var params=new URLSearchParams(location.search);var current=params.get('tab')||'contacts';var initialQ=params.get('q')||'';document.getElementById("search").value=initialQ;var btns=Array.prototype.slice.call(document.querySelectorAll("nav.tabs button"));btns.forEach(function(b){b.onclick=function(){btns.forEach(function(x){x.classList.remove("active")});b.classList.add("active");current=b.dataset.tab;load()}});document.getElementById("search").oninput=function(){render()};function fmt(x){return x||""}function table(head,rows){var t='<table><thead><tr>'+head.map(function(h){return'<th>'+h+'</th>'}).join('')+'</tr></thead><tbody>'+rows.map(function(r){return'<tr>'+r.map(function(c){return'<td>'+fmt(c)+'</td>'}).join('')+'</tr>'}).join('')+'</tbody></table>';document.getElementById('tableWrap').innerHTML=t}function setExport(){var link=document.getElementById('exportLink');link.href='/api/export?type='+current}function render(){setExport();var q=(document.getElementById('search').value||initialQ||'').toLowerCase();fetch('/api/'+current).then(function(r){return r.json()}).then(function(arr){arr=arr.filter(function(x){return JSON.stringify(x).toLowerCase().includes(q)});if(current==='contacts') table(['chatId','name','phone','lastSeen'], arr.map(function(c){return[c.chatId,c.name,c.phone,c.lastSeen]}));else if(current==='purchases') table(['buyerName','buyerPhone','planType','planMonths','priceRM','receiptFile','at'], arr.map(function(p){return[p.buyerName,p.buyerPhone,p.planType,p.planMonths,p.priceRM,p.receiptFile,p.at]}));else if(current==='issues') table(['name','buyerPhone','email','message','at'], arr.map(function(i){return[i.name,i.buyerPhone,(i.account||{}).email||'',i.message,i.at]}));else table(['buyerPhone','oldEmail','newEmail','planType','at'], arr.map(function(r){return[r.buyerPhone,r.oldEmail,r.newEmail,r.planType,r.at]}))})}function load(){render()}load();var n=document.getElementById('crmNav');var m=document.getElementById('menu2');if(m){m.onclick=function(){n.classList.toggle('open')}};</script></main></div></body></html>`
+        const html2 = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>CRM</title><style>:root{--bg:#0d0f14;--panel:#161a22;--text:#e8e8e8;--muted:#9aa5b1}*{box-sizing:border-box}body{font-family:Inter,system-ui,Arial;background:var(--bg);color:var(--text);margin:0;display:flex;min-height:100vh}aside{width:220px;background:#0b0d11;border-right:1px solid #1f2530;padding:18px}aside a{display:block;padding:10px 12px;border-radius:8px;color:#cdd7e3;text-decoration:none;margin-bottom:6px;transition:all .2s ease}aside a.active{background:#141822;color:#fff;border:1px solid #222834}main{flex:1;padding:22px}h1{margin:0 0 12px}nav.tabs{display:flex;gap:10px;margin-bottom:12px;flex-wrap:wrap}nav.tabs button{background:#0b0d11;color:#cdd7e3;border:1px solid #222834;padding:8px 12px;border-radius:8px;cursor:pointer;transition:all .2s ease}nav.tabs button.active{background:#141822;color:#fff}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #222834;padding:8px;text-align:left}input[type=text]{background:#0b0d11;color:#fff;border:1px solid #222834;border-radius:8px;padding:8px;width:100%}.row{display:grid;grid-template-columns:1fr auto;gap:10px;margin-bottom:12px}@media (max-width:640px){aside{position:fixed;left:0;top:0;bottom:0;transform:translateX(-100%);transition:transform .25s ease;width:180px}aside.open{transform:translateX(0)}main{padding:16px}}.btn{background:#0b0d11;color:#cdd7e3;border:1px solid #222834;padding:8px 12px;border-radius:8px;text-decoration:none;transition:all .2s ease}.btn:hover{background:#141822;color:#fff}.topbar{display:none}@media (max-width:640px){.topbar{display:flex;align-items:center;gap:12px;background:#0b0d11;border-bottom:1px solid #1f2530;padding:10px 14px;position:sticky;top:0;z-index:10}}</style></head><body><aside id="crmNav"><a href="/dashboard2">Dashboard</a><a class="active" href="/crm2">CRM</a><a href="/api/stats">API</a></aside><div style="flex:1;display:flex;flex-direction:column"><div class="topbar"><button id="menu2" class="btn">Menu</button><div style="flex:1"></div><a class="btn" href="/dashboard2">Dashboard</a></div><main><h1>CRM</h1><nav class="tabs"><button data-tab="contacts" class="active">Contacts</button><button data-tab="purchases">Purchases</button><button data-tab="issues">Issues</button><button data-tab="replacements">Replacements</button></nav><div class="row"><input id="search" type="text" placeholder="Search"/><a id="exportLink" href="#" class="btn">Export CSV</a></div><div id="tableWrap"></div><script>var params=new URLSearchParams(location.search);var current=params.get('tab')||'contacts';var initialQ=params.get('q')||'';document.getElementById("search").value=initialQ;var btns=Array.prototype.slice.call(document.querySelectorAll("nav.tabs button"));btns.forEach(function(b){b.onclick=function(){btns.forEach(function(x){x.classList.remove("active")});b.classList.add("active");current=b.dataset.tab;load()}});document.getElementById("search").oninput=function(){render()};function fmt(x){return x||""}function table(head,rows){var t='<table><thead><tr>'+head.map(function(h){return'<th>'+h+'</th>'}).join('')+'</tr></thead><tbody>'+rows.map(function(r){return'<tr>'+r.map(function(c){return'<td>'+fmt(c)+'</td>'}).join('')+'</tr>'}).join('')+'</tbody></table>';document.getElementById('tableWrap').innerHTML=t}var API=(localStorage.getItem('api')|| (location.origin.indexOf('sanztech.online')>-1?'https://bot.sanztech.online':''));var TOKEN=(localStorage.getItem('token')|| new URLSearchParams(location.search).get('token')||'');if(TOKEN) localStorage.setItem('token', TOKEN);function apiUrl(p){var u=(API?API:'')+p; if(TOKEN){ u+= (u.indexOf('?')>-1?'&':'?')+'token='+TOKEN } return u }function setExport(){var link=document.getElementById('exportLink');link.href=apiUrl('/api/export?type='+current)}function render(){setExport();var q=(document.getElementById('search').value||initialQ||'').toLowerCase();fetch(apiUrl('/api/'+current)).then(function(r){return r.json()}).then(function(arr){arr=arr.filter(function(x){return JSON.stringify(x).toLowerCase().includes(q)});if(current==='contacts') table(['chatId','name','phone','lastSeen'], arr.map(function(c){return[c.chatId,c.name,c.phone,c.lastSeen]}));else if(current==='purchases') table(['buyerName','buyerPhone','planType','planMonths','priceRM','receiptFile','at'], arr.map(function(p){return[p.buyerName,p.buyerPhone,p.planType,p.planMonths,p.priceRM,p.receiptFile,p.at]}));else if(current==='issues') table(['name','buyerPhone','email','message','at'], arr.map(function(i){return[i.name,i.buyerPhone,(i.account||{}).email||'',i.message,i.at]}));else table(['buyerPhone','oldEmail','newEmail','planType','at'], arr.map(function(r){return[r.buyerPhone,r.oldEmail,r.newEmail,r.planType,r.at]}))})}function load(){render()}load();var n=document.getElementById('crmNav');var m=document.getElementById('menu2');if(m){m.onclick=function(){n.classList.toggle('open')}};</script></main></div></body></html>`
         res.writeHead(200, { 'Content-Type':'text/html' })
         res.end(html2)
         return
       }
       if(u.pathname === '/crm'){
         if(!allowed()){ res.writeHead(401); res.end('Unauthorized'); return }
-        const html = `<!doctype html><html><head><meta charset="utf-8"><title>CRM</title><style>:root{--bg:#0d0f14;--panel:#161a22;--text:#e8e8e8;--muted:#9aa5b1}*{box-sizing:border-box}body{font-family:Inter,system-ui,Arial;background:var(--bg);color:var(--text);margin:0;display:flex;min-height:100vh}aside{width:220px;background:#0b0d11;border-right:1px solid #1f2530;padding:18px}aside a{display:block;padding:10px 12px;border-radius:8px;color:#cdd7e3;text-decoration:none;margin-bottom:6px}aside a.active{background:#141822;color:#fff;border:1px solid #222834}main{flex:1;padding:22px}h1{margin:0 0 12px}nav.tabs{display:flex;gap:10px;margin-bottom:12px}nav.tabs button{background:#0b0d11;color:#cdd7e3;border:1px solid #222834;padding:8px 12px;border-radius:8px;cursor:pointer}nav.tabs button.active{background:#141822;color:#fff}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #222834;padding:8px;text-align:left}input[type=text]{background:#0b0d11;color:#fff;border:1px solid #222834;border-radius:8px;padding:8px;width:100%}.row{display:flex;gap:10px;margin-bottom:12px}</style></head><body><aside><a href="/dashboard">Dashboard</a><a class="active" href="/crm">CRM</a><a href="/api/stats">API</a></aside><main><h1>CRM</h1><nav class="tabs"><button data-tab="contacts" class="active">Contacts</button><button data-tab="purchases">Purchases</button><button data-tab="issues">Issues</button><button data-tab="replacements">Replacements</button></nav><div class="row"><input id="search" type="text" placeholder="Search"/><a id="exportLink" href="#" style="color:#7cc4ff;text-decoration:none">Export CSV</a></div><div id="tableWrap"></div><script>var current="contacts";var btns=Array.prototype.slice.call(document.querySelectorAll("nav.tabs button"));btns.forEach(function(b){b.onclick=function(){btns.forEach(function(x){x.classList.remove("active")});b.classList.add("active");current=b.dataset.tab;load()}});document.getElementById("search").oninput=function(){render(window._rows||[])};document.getElementById("exportLink").onclick=function(e){e.preventDefault();location.href="/api/export?type="+current};function esc(s){return String(s||"")}function rowContacts(r){return "<tr><td>"+esc(r.name)+"</td><td>"+esc(r.phone)+"</td><td>"+esc(r.lastSeen)+"</td></tr>"}function rowPurchases(r){return "<tr><td>"+esc(r.buyerName)+"</td><td>"+esc(r.buyerPhone)+"</td><td>"+esc(r.planType)+"</td><td>"+esc(r.planMonths)+"</td><td>"+esc(r.priceRM)+"</td><td>"+esc(r.at)+"</td></tr>"}function rowIssues(r){return "<tr><td>"+esc(r.name)+"</td><td>"+esc(r.buyerPhone)+"</td><td>"+esc((r.account||{}).email)+"</td><td>"+esc((r.message||"").slice(0,120))+"</td><td>"+esc(r.at)+"</td></tr>"}function rowRepl(r){return "<tr><td>"+esc(r.buyerPhone)+"</td><td>"+esc(r.oldEmail)+"</td><td>"+esc(r.newEmail)+"</td><td>"+esc(r.planType)+"</td><td>"+esc(r.at)+"</td></tr>"}async function load(){var token=new URLSearchParams(location.search).get("token");var url="/api/"+current+(token?"?token="+token:"");var res=await fetch(url);var rows=await res.json();window._rows=rows;render(rows)}function render(rows){var q=(document.getElementById("search").value||"").toLowerCase();var list=rows.filter(function(r){return JSON.stringify(r).toLowerCase().indexOf(q)>-1});var html='';if(current==='contacts'){html='<table><tr><th>Name</th><th>Phone</th><th>Last Seen</th></tr>'+list.map(rowContacts).join('')+'</table>'}else if(current==='purchases'){html='<table><tr><th>Name</th><th>Phone</th><th>Plan</th><th>Months</th><th>Price RM</th><th>Date</th></tr>'+list.map(rowPurchases).join('')+'</table>'}else if(current==='issues'){html='<table><tr><th>Name</th><th>Phone</th><th>Email</th><th>Message</th><th>Date</th></tr>'+list.map(rowIssues).join('')+'</table>'}else{html='<table><tr><th>Phone</th><th>Old</th><th>New</th><th>Plan</th><th>Date</th></tr>'+list.map(rowRepl).join('')+'</table>'}document.getElementById("tableWrap").innerHTML=html}load()</script></main></body></html>`
+        const html = `<!doctype html><html><head><meta charset="utf-8"><title>CRM</title><style>:root{--bg:#0d0f14;--panel:#161a22;--text:#e8e8e8;--muted:#9aa5b1}*{box-sizing:border-box}body{font-family:Inter,system-ui,Arial;background:var(--bg);color:var(--text);margin:0;display:flex;min-height:100vh}aside{width:220px;background:#0b0d11;border-right:1px solid #1f2530;padding:18px}aside a{display:block;padding:10px 12px;border-radius:8px;color:#cdd7e3;text-decoration:none;margin-bottom:6px}aside a.active{background:#141822;color:#fff;border:1px solid #222834}main{flex:1;padding:22px}h1{margin:0 0 12px}nav.tabs{display:flex;gap:10px;margin-bottom:12px}nav.tabs button{background:#0b0d11;color:#cdd7e3;border:1px solid #222834;padding:8px 12px;border-radius:8px;cursor:pointer}nav.tabs button.active{background:#141822;color:#fff}table{width:100%;border-collapse:collapse}th,td{border-bottom:1px solid #222834;padding:8px;text-align:left}input[type=text]{background:#0b0d11;color:#fff;border:1px solid #222834;border-radius:8px;padding:8px;width:100%}.row{display:flex;gap:10px;margin-bottom:12px}</style></head><body><aside><a href="/dashboard">Dashboard</a><a class="active" href="/crm">CRM</a><a href="/api/stats">API</a></aside><main><h1>CRM</h1><nav class="tabs"><button data-tab="contacts" class="active">Contacts</button><button data-tab="purchases">Purchases</button><button data-tab="issues">Issues</button><button data-tab="replacements">Replacements</button></nav><div class="row"><input id="search" type="text" placeholder="Search"/><a id="exportLink" href="#" style="color:#7cc4ff;text-decoration:none">Export CSV</a></div><div id="tableWrap"></div><script>var current="contacts";var btns=Array.prototype.slice.call(document.querySelectorAll("nav.tabs button"));btns.forEach(function(b){b.onclick=function(){btns.forEach(function(x){x.classList.remove("active")});b.classList.add("active");current=b.dataset.tab;load()}});document.getElementById("search").oninput=function(){render(window._rows||[])};var API=(localStorage.getItem('api')|| (location.origin.indexOf('sanztech.online')>-1?'https://bot.sanztech.online':''));var TOKEN=(localStorage.getItem('token')|| new URLSearchParams(location.search).get('token')||'');if(TOKEN) localStorage.setItem('token', TOKEN);function apiUrl(p){var u=(API?API:'')+p; if(TOKEN){ u+= (u.indexOf('?')>-1?'&':'?')+'token='+TOKEN } return u }document.getElementById("exportLink").onclick=function(e){e.preventDefault();location.href=apiUrl('/api/export?type='+current)};function esc(s){return String(s||"")}function rowContacts(r){return "<tr><td>"+esc(r.name)+"</td><td>"+esc(r.phone)+"</td><td>"+esc(r.lastSeen)+"</td></tr>"}function rowPurchases(r){return "<tr><td>"+esc(r.buyerName)+"</td><td>"+esc(r.buyerPhone)+"</td><td>"+esc(r.planType)+"</td><td>"+esc(r.planMonths)+"</td><td>"+esc(r.priceRM)+"</td><td>"+esc(r.at)+"</td></tr>"}function rowIssues(r){return "<tr><td>"+esc(r.name)+"</td><td>"+esc(r.buyerPhone)+"</td><td>"+esc((r.account||{}).email)+"</td><td>"+esc((r.message||"").slice(0,120))+"</td><td>"+esc(r.at)+"</td></tr>"}function rowRepl(r){return "<tr><td>"+esc(r.buyerPhone)+"</td><td>"+esc(r.oldEmail)+"</td><td>"+esc(r.newEmail)+"</td><td>"+esc(r.planType)+"</td><td>"+esc(r.at)+"</td></tr>"}async function load(){var res=await fetch(apiUrl('/api/'+current));var rows=await res.json();window._rows=rows;render(rows)}function render(rows){var q=(document.getElementById("search").value||"").toLowerCase();var list=rows.filter(function(r){return JSON.stringify(r).toLowerCase().indexOf(q)>-1});var html='';if(current==='contacts'){html='<table><tr><th>Name</th><th>Phone</th><th>Last Seen</th></tr>'+list.map(rowContacts).join('')+'</table>'}else if(current==='purchases'){html='<table><tr><th>Name</th><th>Phone</th><th>Plan</th><th>Months</th><th>Price RM</th><th>Date</th></tr>'+list.map(rowPurchases).join('')+'</table>'}else if(current==='issues'){html='<table><tr><th>Name</th><th>Phone</th><th>Email</th><th>Message</th><th>Date</th></tr>'+list.map(rowIssues).join('')+'</table>'}else{html='<table><tr><th>Phone</th><th>Old</th><th>New</th><th>Plan</th><th>Date</th></tr>'+list.map(rowRepl).join('')+'</table>'}document.getElementById("tableWrap").innerHTML=html}load()</script></main></body></html>`
         res.writeHead(200, { 'Content-Type':'text/html' })
         res.end(html)
         return
@@ -860,4 +930,26 @@ async function runExpiryReminders(){
 function startReminderScheduler(){
   runExpiryReminders()
   setInterval(runExpiryReminders, 6*3600*1000)
+}
+async function analyzeReceiptLLM(base64, mime, caption){
+  try{
+    const key = process.env.OPENROUTER_API_KEY
+    if(!key) return null
+    const url = 'https://openrouter.ai/api/v1/chat/completions'
+    const content = [
+      { type:'text', text: 'Ekstrak amount (RM), merchant, status berjaya/gagal, kaedah bayar dan tarikh daripada imej resit. Balas JSON ringkas dengan kunci: amountRM, currency, success, merchant, method, time.' },
+      { type:'input_image', image_url: { url: `data:${mime};base64,${base64}` } }
+    ]
+    const body = { model:'openai/gpt-4o', messages:[{ role:'user', content }], temperature:0.2, max_tokens:200 }
+    const res = await fetch(url,{ method:'POST', headers:{ 'Authorization':`Bearer ${key}`, 'Content-Type':'application/json' }, body: JSON.stringify(body) })
+    const data = await res.json()
+    const txt = data?.choices?.[0]?.message?.content?.trim() || ''
+    let obj = null
+    try{ obj = JSON.parse(txt) }catch{}
+    if(obj && typeof obj==='object') return obj
+    const m = txt.match(/amount\s*[:=]\s*rm?\s*([0-9]+(?:\.[0-9]+)?)/i)
+    const amt = m ? Math.round(parseFloat(m[1])) : null
+    const succ = /berjaya|successful|success/i.test(txt)
+    return { amountRM: amt, currency: 'RM', success: succ || null }
+  }catch{ return null }
 }
